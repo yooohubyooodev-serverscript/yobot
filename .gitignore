@@ -1,11 +1,10 @@
 __pycache__/
 *.py[cod]
-
-.env
-.env.*
 work/
-
+.env
 *.log
-
-.vscode/
-.idea/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
