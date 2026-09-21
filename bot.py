@@ -1,9 +1,8 @@
 """
 Discord Lua/Luau deobfuscation bot.
 
-Only static preprocessors are active. Advanced engines are reported
-as unavailable with documented reasons. No untrusted Lua is ever
-executed.
+Static preprocessors only.
+No untrusted Lua/Luau code is executed.
 """
 
 from __future__ import annotations
@@ -24,7 +23,9 @@ from core.downloader import download_url, MAX_FILE_SIZE
 from core.pipeline import process
 from core.reporter import build_discord_message, write_report
 
+
 TOKEN = os.getenv("DISCORD_TOKEN")
+
 WORK_ROOT = Path("work")
 WORK_ROOT.mkdir(exist_ok=True)
 
@@ -38,7 +39,46 @@ def clean_filename(name: str) -> str:
     return name or "input.lua"
 
 
-@bot.tree.command(name="deobf", description="ถอด/วิเคราะห์ Lua หรือ Luau (static only)")
+async def read_discord_attachment(
+    attachment: discord.Attachment,
+) -> tuple[bytes, str]:
+
+    if attachment.size and attachment.size > MAX_FILE_SIZE:
+        raise ValueError("ไฟล์ใหญ่เกิน 10 MB")
+
+    last_error: Exception | None = None
+
+    # ลองดาวน์โหลดสูงสุด 3 ครั้ง
+    for attempt in range(1, 4):
+        try:
+            data = await attachment.read(use_cached=False)
+
+            if not data:
+                raise ValueError("ไฟล์ว่าง")
+
+            if len(data) > MAX_FILE_SIZE:
+                raise ValueError("ไฟล์ใหญ่เกิน 10 MB")
+
+            filename = attachment.filename or "input.lua"
+
+            return data, filename
+
+        except Exception as exc:
+            last_error = exc
+
+            if attempt < 3:
+                await asyncio.sleep(2)
+
+    raise RuntimeError(
+        f"ไม่สามารถดาวน์โหลดไฟล์จาก Discord ได้หลังจากลอง 3 ครั้ง: "
+        f"{last_error}"
+    )
+
+
+@bot.tree.command(
+    name="deobf",
+    description="ถอด/วิเคราะห์ Lua หรือ Luau (static only)",
+)
 @app_commands.describe(
     url="URL ของไฟล์ Lua/Luau",
     file="ไฟล์ .lua หรือ .luau",
@@ -48,12 +88,15 @@ async def deobf(
     url: str | None = None,
     file: discord.Attachment | None = None,
 ):
+
+    # ต้องเลือกอย่างใดอย่างหนึ่ง
     if url and file:
         await interaction.response.send_message(
             "❌ เลือก URL หรือไฟล์อย่างใดอย่างหนึ่ง",
             ephemeral=True,
         )
         return
+
     if not url and not file:
         await interaction.response.send_message(
             "❌ ใส่ URL หรือแนบไฟล์",
@@ -68,25 +111,44 @@ async def deobf(
     work_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # ---- input ----
-        if url:
-            data, filename = await download_url(url)
-        else:
-            if file.size and file.size > MAX_FILE_SIZE:
-                raise ValueError("ไฟล์ใหญ่เกิน 10 MB")
-            data = await file.read()
-            if len(data) > MAX_FILE_SIZE:
-                raise ValueError("ไฟล์ใหญ่เกิน 10 MB")
-            filename = file.filename or "input.lua"
 
-        source = data.decode("utf-8", errors="replace")
+        # =========================================================
+        # INPUT
+        # =========================================================
+
+        if url:
+
+            data, filename = await download_url(url)
+
+        else:
+
+            # ดาวน์โหลดไฟล์จาก Discord พร้อม Retry
+            data, filename = await read_discord_attachment(file)
+
+        # =========================================================
+        # DECODE INPUT
+        # =========================================================
+
+        source = data.decode(
+            "utf-8",
+            errors="replace",
+        )
+
         if not source.strip():
             raise ValueError("ไฟล์ว่าง")
 
         safe_name = clean_filename(filename)
+
+        # =========================================================
+        # DETECTION
+        # =========================================================
+
         detected = detect(source)
 
-        # ---- pipeline (CPU-bound → thread) ----
+        # =========================================================
+        # PIPELINE
+        # =========================================================
+
         report = await asyncio.to_thread(
             process,
             source,
@@ -95,48 +157,110 @@ async def deobf(
             detected,
         )
 
-        # ---- write files ----
+        # =========================================================
+        # REPORT
+        # =========================================================
+
         report_path = work_dir / "report.json"
-        write_report(report, report_path)
+
+        write_report(
+            report,
+            report_path,
+        )
+
+        # =========================================================
+        # FILES TO SEND
+        # =========================================================
 
         files_to_send: list[discord.File] = [
-            discord.File(report_path, filename="report.json"),
+            discord.File(
+                report_path,
+                filename="report.json",
+            )
         ]
 
+        # =========================================================
+        # OUTPUT
+        # =========================================================
+
         if report.output_filename and report.final_source:
+
             out_path = work_dir / report.output_filename
-            out_path.write_text(report.final_source, encoding="utf-8")
-            files_to_send.insert(
-                0,
-                discord.File(out_path, filename=report.output_filename),
+
+            out_path.write_text(
+                report.final_source,
+                encoding="utf-8",
             )
 
+            files_to_send.insert(
+                0,
+                discord.File(
+                    out_path,
+                    filename=report.output_filename,
+                ),
+            )
+
+        # =========================================================
+        # SEND RESULT
+        # =========================================================
+
         msg = build_discord_message(report)
-        await interaction.followup.send(content=msg, files=files_to_send)
+
+        await interaction.followup.send(
+            content=msg,
+            files=files_to_send,
+        )
 
     except Exception as exc:
+
+        error_text = str(exc)
+
         await interaction.followup.send(
-            f"❌ เกิดข้อผิดพลาด:\n```text\n{str(exc)[:3000]}\n```"
+            "❌ เกิดข้อผิดพลาด:\n"
+            "```text\n"
+            f"{error_text[:3000]}\n"
+            "```"
         )
+
     finally:
-        # cleanup job directory
+
+        # ลบไฟล์ชั่วคราวหลังจบงาน
         try:
-            shutil.rmtree(work_dir, ignore_errors=True)
+            shutil.rmtree(
+                work_dir,
+                ignore_errors=True,
+            )
         except Exception:
             pass
 
 
 @bot.event
 async def on_ready():
+
     try:
+
         synced = await bot.tree.sync()
+
         print(f"Bot: {bot.user}")
         print(f"Slash commands: {len(synced)}")
+
     except Exception as exc:
+
         print(f"Sync error: {exc}")
 
 
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is not set")
+# =============================================================
+# TOKEN CHECK
+# =============================================================
 
-bot.run(TOKEN)
+if not TOKEN:
+    raise RuntimeError(
+        "DISCORD_TOKEN is not set"
+    )
+
+
+# =============================================================
+# START BOT
+# =============================================================
+
+bot.run(TOKEN)N)
