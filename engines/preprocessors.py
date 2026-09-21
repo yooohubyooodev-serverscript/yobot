@@ -1,209 +1,321 @@
-"""Static-only preprocessors / normalizers.
-
-These are NOT full deobfuscators. They only reverse common string
-encodings that appear in many obfuscated scripts. They never execute
-any code from the input.
-"""
-
 from __future__ import annotations
 
 import base64
+import binascii
 import re
-from urllib.parse import unquote
 
 from .base import BaseEngine, EngineResult, EngineStatus
 
 
-def _text_score(text: str) -> float:
-    if not text:
-        return 0.0
-    good = sum(1 for c in text if c.isprintable() or c in "\r\n\t")
-    return good / len(text)
-
-
 class Base64Preprocessor(BaseEngine):
-    name = "Base64 preprocessor"
+    name = "base64"
+
+    _pattern = re.compile(
+        r'(?P<quote>["\'])(?P<data>[A-Za-z0-9+/]{16,}={0,2})(?P=quote)'
+    )
 
     def can_handle(self, source: str) -> bool:
-        return bool(re.search(r"[A-Za-z0-9+/]{16,}={0,2}", source))
-
-    def run(self, source: str, work_dir: str) -> EngineResult:
-        pattern = re.compile(
-            r"""(["'])([A-Za-z0-9+/]{16,}={0,2})\1"""
-        )
-        changed = False
-
-        def repl(m: re.Match) -> str:
-            nonlocal changed
-            value = m.group(2)
+        for match in self._pattern.finditer(source):
+            data = match.group("data")
             try:
-                raw = base64.b64decode(value, validate=True)
-                decoded = raw.decode("utf-8")
-                if _text_score(decoded) >= 0.80:
-                    changed = True
-                    return m.group(1) + decoded + m.group(1)
+                decoded = base64.b64decode(data, validate=True)
+                if decoded and any(32 <= b < 127 for b in decoded):
+                    return True
             except Exception:
                 pass
-            return m.group(0)
+        return False
 
-        result = pattern.sub(repl, source)
-        if not changed:
-            return EngineResult(
-                status=EngineStatus.NO_CHANGE,
-                output=source,
-                message="No Base64 strings decoded",
-                engine_name=self.name,
-            )
+    def run(self, source: str) -> EngineResult:
+        changed = False
+
+        def replace(match: re.Match) -> str:
+            nonlocal changed
+
+            data = match.group("data")
+
+            try:
+                decoded = base64.b64decode(data, validate=True)
+
+                if not decoded:
+                    return match.group(0)
+
+                text = decoded.decode("utf-8")
+
+                if not text:
+                    return match.group(0)
+
+                changed = True
+                return repr(text)
+
+            except Exception:
+                return match.group(0)
+
+        output = self._pattern.sub(replace, source)
+
         return EngineResult(
-            status=EngineStatus.SUCCESS,
-            output=result,
-            message="Decoded one or more Base64 strings",
-            engine_name=self.name,
+            status=(
+                EngineStatus.SUCCESS
+                if changed
+                else EngineStatus.NO_CHANGE
+            ),
+            output=output,
+            message="Base64 decoded" if changed else "No Base64 found",
         )
 
 
 class HexPreprocessor(BaseEngine):
-    name = "Hex preprocessor"
+    name = "hex"
+
+    _pattern = re.compile(
+        r'(?P<quote>["\'])(?P<data>[0-9a-fA-F]{16,})(?P=quote)'
+    )
 
     def can_handle(self, source: str) -> bool:
-        return bool(re.search(r"[0-9A-Fa-f]{16,}", source))
+        return bool(self._pattern.search(source))
 
-    def run(self, source: str, work_dir: str) -> EngineResult:
-        pattern = re.compile(r"""(["'])([0-9A-Fa-f]{16,})\1""")
+    def run(self, source: str) -> EngineResult:
         changed = False
 
-        def repl(m: re.Match) -> str:
+        def replace(match: re.Match) -> str:
             nonlocal changed
-            value = m.group(2)
-            if len(value) % 2:
-                return m.group(0)
-            try:
-                decoded = bytes.fromhex(value).decode("utf-8")
-                if _text_score(decoded) >= 0.80:
-                    changed = True
-                    return m.group(1) + decoded + m.group(1)
-            except Exception:
-                pass
-            return m.group(0)
 
-        result = pattern.sub(repl, source)
-        if not changed:
-            return EngineResult(
-                status=EngineStatus.NO_CHANGE,
-                output=source,
-                message="No hex strings decoded",
-                engine_name=self.name,
-            )
+            data = match.group("data")
+
+            if len(data) % 2 != 0:
+                return match.group(0)
+
+            try:
+                decoded = bytes.fromhex(data)
+                text = decoded.decode("utf-8")
+
+                if not text:
+                    return match.group(0)
+
+                changed = True
+                return repr(text)
+
+            except Exception:
+                return match.group(0)
+
+        output = self._pattern.sub(replace, source)
+
         return EngineResult(
-            status=EngineStatus.SUCCESS,
-            output=result,
-            message="Decoded one or more hex strings",
-            engine_name=self.name,
+            status=(
+                EngineStatus.SUCCESS
+                if changed
+                else EngineStatus.NO_CHANGE
+            ),
+            output=output,
+            message="Hex decoded" if changed else "No Hex found",
         )
 
 
 class LuaEscapePreprocessor(BaseEngine):
-    name = "Lua escape preprocessor"
+    name = "lua_escape"
+
+    _pattern = re.compile(
+        r'\\(?:x[0-9a-fA-F]{2}|[0-9]{1,3})'
+    )
 
     def can_handle(self, source: str) -> bool:
-        return "\\" in source
+        return bool(self._pattern.search(source))
 
-    def run(self, source: str, work_dir: str) -> EngineResult:
-        pattern = re.compile(
-            r"""(["'])(.*?\\(?:x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|[nrt\\]).*?)\1"""
-        )
-        changed = False
-
-        def repl(m: re.Match) -> str:
-            nonlocal changed
-            quote, value = m.group(1), m.group(2)
-            try:
-                decoded = bytes(value, "utf-8").decode("unicode_escape")
-                if decoded != value:
-                    changed = True
-                    return quote + decoded + quote
-            except Exception:
-                pass
-            return m.group(0)
-
-        result = pattern.sub(repl, source)
-        if not changed:
+    def run(self, source: str) -> EngineResult:
+        if not self.can_handle(source):
             return EngineResult(
                 status=EngineStatus.NO_CHANGE,
                 output=source,
-                message="No escape sequences decoded",
-                engine_name=self.name,
+                message="No Lua escapes found",
             )
-        return EngineResult(
-            status=EngineStatus.SUCCESS,
-            output=result,
-            message="Decoded Lua escape sequences",
-            engine_name=self.name,
-        )
+
+        try:
+            output = re.sub(
+                r'\\x([0-9a-fA-F]{2})',
+                lambda m: chr(int(m.group(1), 16)),
+                source,
+            )
+
+            output = re.sub(
+                r'\\([0-9]{1,3})',
+                lambda m: chr(int(m.group(1), 10))
+                if int(m.group(1), 10) <= 255
+                else m.group(0),
+                output,
+            )
+
+            return EngineResult(
+                status=(
+                    EngineStatus.SUCCESS
+                    if output != source
+                    else EngineStatus.NO_CHANGE
+                ),
+                output=output,
+                message="Lua escapes decoded",
+            )
+
+        except Exception as exc:
+            return EngineResult(
+                status=EngineStatus.ERROR,
+                output=source,
+                message=str(exc),
+            )
 
 
 class StringCharPreprocessor(BaseEngine):
-    name = "string.char preprocessor"
+    name = "string.char"
+
+    _pattern = re.compile(
+        r'string\.char\s*\(\s*'
+        r'((?:\d{1,3}\s*,\s*)+\d{1,3})'
+        r'\s*\)'
+    )
 
     def can_handle(self, source: str) -> bool:
-        return "string.char" in source.lower()
+        return bool(self._pattern.search(source))
 
-    def run(self, source: str, work_dir: str) -> EngineResult:
-        pattern = re.compile(
-            r"string\.char\s*\(\s*((?:\d{1,3}\s*,?\s*)+)\)"
-        )
+    def run(self, source: str) -> EngineResult:
         changed = False
 
-        def repl(m: re.Match) -> str:
+        def replace(match: re.Match) -> str:
             nonlocal changed
+
+            numbers = re.findall(r"\d{1,3}", match.group(1))
+
             try:
-                nums = [int(x) for x in re.findall(r"\d+", m.group(1))]
-                if not nums or not all(0 <= n <= 255 for n in nums):
-                    return m.group(0)
-                decoded = "".join(chr(n) for n in nums)
+                values = [int(n) for n in numbers]
+
+                if any(n > 255 for n in values):
+                    return match.group(0)
+
+                decoded = "".join(chr(n) for n in values)
+
                 changed = True
                 return repr(decoded)
-            except Exception:
-                return m.group(0)
 
-        result = pattern.sub(repl, source)
-        if not changed:
-            return EngineResult(
-                status=EngineStatus.NO_CHANGE,
-                output=source,
-                message="No string.char calls expanded",
-                engine_name=self.name,
-            )
+            except Exception:
+                return match.group(0)
+
+        output = self._pattern.sub(replace, source)
+
         return EngineResult(
-            status=EngineStatus.SUCCESS,
-            output=result,
-            message="Expanded string.char calls",
-            engine_name=self.name,
+            status=(
+                EngineStatus.SUCCESS
+                if changed
+                else EngineStatus.NO_CHANGE
+            ),
+            output=output,
+            message=(
+                "string.char decoded"
+                if changed
+                else "No string.char found"
+            ),
         )
 
 
 class StringConcatPreprocessor(BaseEngine):
-    name = "String concat preprocessor"
+    name = "string_concat"
+
+    _pattern = re.compile(
+        r'(["\'])(.*?)\1\s*\.\s*(["\'])(.*?)\3'
+    )
 
     def can_handle(self, source: str) -> bool:
-        return ".." in source
+        return bool(self._pattern.search(source))
 
-    def run(self, source: str, work_dir: str) -> EngineResult:
-        pattern = re.compile(r'"([^"\n]*)"\s*\.\.\s*"([^"\n]*)"')
-        result, count = pattern.subn(
-            lambda m: '"' + m.group(1) + m.group(2) + '"',
-            source,
-        )
-        if count == 0:
-            return EngineResult(
-                status=EngineStatus.NO_CHANGE,
-                output=source,
-                message="No simple string concatenations found",
-                engine_name=self.name,
-            )
+    def run(self, source: str) -> EngineResult:
+        changed = False
+
+        def replace(match: re.Match) -> str:
+            nonlocal changed
+            changed = True
+            return repr(match.group(2) + match.group(4))
+
+        output = self._pattern.sub(replace, source)
+
         return EngineResult(
-            status=EngineStatus.SUCCESS,
-            output=result,
-            message=f"Folded {count} string concatenations",
-            engine_name=self.name,
+            status=(
+                EngineStatus.SUCCESS
+                if changed
+                else EngineStatus.NO_CHANGE
+            ),
+            output=output,
+            message=(
+                "String concatenation simplified"
+                if changed
+                else "No string concatenation found"
+            ),
         )
+
+
+class BinaryPreprocessor(BaseEngine):
+    name = "binary"
+
+    # ตัวอย่าง:
+    # 01001000 01100101 01101100 01101100 01101111
+    #
+    # รองรับทั้งข้อความที่อยู่ตรง ๆ
+    # และข้อความที่อยู่ใน string ของ Lua
+    _pattern = re.compile(
+        r'(?<![01])'
+        r'((?:[01]{8}\s+){1,}[01]{8})'
+        r'(?![01])'
+    )
+
+    def can_handle(self, source: str) -> bool:
+        return bool(self._pattern.search(source))
+
+    def run(self, source: str) -> EngineResult:
+        changed = False
+
+        def replace(match: re.Match) -> str:
+            nonlocal changed
+
+            binary_text = match.group(1)
+            values = binary_text.split()
+
+            try:
+                decoded = bytes(
+                    int(value, 2)
+                    for value in values
+                )
+
+                text = decoded.decode("utf-8")
+
+                if not text:
+                    return match.group(0)
+
+                changed = True
+                return text
+
+            except (ValueError, UnicodeDecodeError):
+                return match.group(0)
+
+        output = self._pattern.sub(replace, source)
+
+        return EngineResult(
+            status=(
+                EngineStatus.SUCCESS
+                if changed
+                else EngineStatus.NO_CHANGE
+            ),
+            output=output,
+            message=(
+                "Binary decoded"
+                if changed
+                else "No binary sequence found"
+            ),
+        )
+
+
+# ---------------------------------------------------------
+# รายการ Preprocessors ที่ Pipeline จะเรียกใช้งาน
+# ---------------------------------------------------------
+
+PREPROCESSORS = [
+    BinaryPreprocessor(),
+    Base64Preprocessor(),
+    HexPreprocessor(),
+    LuaEscapePreprocessor(),
+    StringCharPreprocessor(),
+    StringConcatPreprocessor(),
+]
